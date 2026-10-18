@@ -4,6 +4,15 @@ Prepared locally on October 18, 2026 for GPS-002. The same supplied source proje
 
 Read `DEVICE.md`, `AI_SETUP_INSTRUCTIONS.md`, and `GPS_STUCK_MARKER.md` first. This is a source/reference package with separately identified local candidates, not an installed or physically validated unified system.
 
+## Guided local GPS test
+
+See `LOCAL_SETUP.md`. On this Pi, `python3 run-local.py` guides a separately
+approved foreground sender session using the existing monitor, private config
+and queue. It does not install services, change boot/GNSS, enable camera/Wi-Fi,
+or publish last-known data as fresh. Windows uses `start-local.cmd` from the
+existing CentraBus workspace. This is locally tested preparation, not physical
+deployment or a reason to apply Pi1's receiver assumptions to Pi2.
+
 ## GitHub source publication
 
 Repository: [PI-2-UNIFIED](https://github.com/centrabusapp-png/PI-2-UNIFIED).
