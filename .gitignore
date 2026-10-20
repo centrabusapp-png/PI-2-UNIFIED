@@ -4,12 +4,16 @@
 **/*.pem
 **/*.key
 **/credentials*.json
+**/camera-private.json
+**/enroll-camera-PRIVATE.sql
 **/service-account.json
 **/*.sqlite*
 **/*.db
 **/__pycache__/
 **/*.pyc
 .test-tmp/
+/qa/.results/
+/qa/staged-builds/
 .local-run/
 *.local-session.lock
 *connection-review*.json
