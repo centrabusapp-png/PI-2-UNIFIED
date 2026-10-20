@@ -1,4 +1,4 @@
-"""Local physical-console GUI. Loopback only; no cloud, GPS or service control."""
+"""Local-console GUI with opt-in setup presence; no GPS or service control."""
 from __future__ import annotations
 import argparse
 import getpass
@@ -15,13 +15,15 @@ import time
 import webbrowser
 
 from network import NetworkManager, RecoveryUnverified, SetupError
+from backend import check_backend, public_origin
+from presence import PresenceClient, PresenceSession, default_config_files, read_key
 
 ASSETS = Path(__file__).resolve().parent / "web"
 DEVICES = {"GPS-001": ("centrabus1", "centrabus1-pi"), "GPS-002": ("centrabus", "centrabus-pi")}
 
 
 class Application:
-    def __init__(self, device_id, manager=None, *, preview=False):
+    def __init__(self, device_id, manager=None, *, preview=False, backend_origin=None, presence_env=None):
         if device_id not in DEVICES:
             raise SetupError("Unsupported package identity.")
         self.device_id, self.manager, self.preview = device_id, manager, preview
@@ -34,6 +36,41 @@ class Application:
         self.busy = False
         self.stopping = False
         self.timer = None
+        self.connection_message = "Use Enable connections to approve trials and request OS rollback authorization."
+        self.backend_busy = False
+        self.backend = {"origin": public_origin(backend_origin) if backend_origin else "", "state": "not_checked",
+                        "checkedAt": None, "message": "Express API has not been checked. Wi-Fi connectivity alone does not verify dashboard delivery."}
+        self.presence_env = tuple(presence_env or ())
+        self.presence_session = None
+        self.observation = {"wifiConnected": None, "internet": "unknown"}
+        self.observed_at = 0
+        self.reopening = False
+        self.last_reopen = None
+
+    def reopen_session(self, origin):
+        """Deliver a session only to this Pi's desktop browser, never HTTP callers."""
+        with self.lock:
+            now = time.monotonic()
+            if self.stopping:
+                raise SetupError("Setup is closing. Relaunch it from this Pi's desktop terminal.")
+            if self.reopening or self.last_reopen is not None and now - self.last_reopen < 5:
+                raise SetupError("A fresh setup window was just requested. Switch to that window or wait five seconds.")
+            if now >= self.expires:
+                self.token = secrets.token_urlsafe(32)
+                self.expires = now + 1800
+            url = origin + "/#" + self.token
+            self.last_reopen, self.reopening = now, True
+
+        def open_window():
+            try:
+                webbrowser.open(url, new=1)
+            except Exception:
+                pass  # Browser errors must not print the private launch URL.
+            finally:
+                with self.lock:
+                    self.reopening = False
+        threading.Thread(target=open_window, daemon=True).start()
+        return {"accepted": True}
 
     def status(self):
         observation = {"connected": None, "internet": "unknown", "manager": "Unavailable", "interface": None}
@@ -44,11 +81,111 @@ class Application:
                 pass
         # Do not expose profile UUIDs, raw commands or raw errors to the browser.
         with self.lock:
+            self.observation = {"wifiConnected": observation["connected"], "internet": observation["internet"]}
+            self.observed_at = time.monotonic()
             return {"deviceId": self.device_id, "preview": self.preview,
                     "changesEnabled": bool(self.manager and self.manager.allow_changes),
                     "scanAvailable": bool(self.manager), "wifiConnected": observation["connected"],
                     "internet": observation["internet"], "manager": observation["manager"],
-                    "interface": observation["interface"], "task": dict(self.task)}
+                    "interface": observation["interface"], "task": dict(self.task),
+                    "connectionMessage": self.connection_message, "backend": dict(self.backend),
+                    "presence": self._presence_status()}
+
+    def _presence_status(self):
+        configured = bool(self.presence_env) and not self.preview
+        report = self.presence_session.status() if self.presence_session else {
+            "state": "stopped" if configured else "not_configured", "configured": configured,
+            "active": False, "running": False,
+            "message": "This app has not sent an authenticated setup check-in. "
+                       + ("Approve Start check-ins to use the existing private device configuration." if configured else
+                          "Launch with existing private device configuration to enable check-ins.")}
+        report["canStart"] = (configured and not report["running"] and not self.stopping and not self.backend_busy
+                              and time.monotonic() < self.expires and self.backend.get("state") == "ready"
+                              and self.backend.get("setupPresenceEnabled") is True)
+        return report
+
+    def _presence_observation(self):
+        with self.lock:
+            if time.monotonic() - self.observed_at > 15:
+                return {"wifiConnected": None, "internet": "unknown"}
+            return dict(self.observation)
+
+    def presence_start(self, data):
+        if set(data) != {"confirmed"} or data["confirmed"] is not True:
+            raise SetupError("Approve authenticated setup-only check-ins before starting.")
+        with self.lock:
+            if self.preview or not self.manager or not self._presence_status()["canStart"]:
+                raise SetupError("Check the setup API and existing private device configuration first. Finish any previous check-in worker.")
+            checked_at = self.backend.get("checkedAt")
+            if not isinstance(checked_at, (int, float)) or not 0 <= time.time() - checked_at <= 60:
+                raise SetupError("Check Express API again before approving check-ins.")
+            key = read_key(self.presence_env, self.device_id)
+            client = PresenceClient(self.backend["origin"], self.device_id, key)
+            self.presence_session = PresenceSession(client, self._presence_observation, deadline=self.expires)
+            self.presence_session.start()
+            return {"presence": self._presence_status()}
+
+    def presence_stop(self):
+        with self.lock:
+            session = self.presence_session
+        if session:
+            session.stop()
+        with self.lock:
+            return {"presence": self._presence_status()}
+
+    def authorize(self, data):
+        if set(data) != {"confirmed"} or data["confirmed"] is not True:
+            raise SetupError("Approve connection trials at this Pi before enabling them.")
+        with self.lock:
+            if self.preview or not self.manager:
+                raise SetupError("Connection trials require this Pi's local desktop session.")
+            if self.busy or self.trial or self.stopping or self.task["state"] == "unknown":
+                raise SetupError("Finish the current operation and verify the original Wi-Fi first.")
+            self.busy = True
+            self.task = {"state": "authorizing", "message": "Complete OS authentication in the Pi dialog or the CentraBus OS Wi-Fi authorization terminal. No network is being switched."}
+            self.connection_message = self.task["message"]
+
+        def worker():
+            try:
+                self.manager.authorize()
+                with self.lock:
+                    if self.stopping:
+                        self.manager.allow_changes = False
+                        return
+                    self.connection_message = "Connections enabled for this session. Select a recently scanned network and approve its trial."
+                    self.task = {"state": "idle", "message": self.connection_message}
+            except Exception as error:
+                with self.lock:
+                    self.manager.allow_changes = False
+                    message = str(error) if isinstance(error, SetupError) else "Authorization failed. Retry from this Pi's desktop terminal."
+                    self.connection_message = message
+                    self.task = {"state": "unknown" if isinstance(error, RecoveryUnverified) else "failed", "message": message}
+            finally:
+                with self.lock:
+                    self.busy = False
+        threading.Thread(target=worker, daemon=False).start()
+        return {"accepted": True}
+
+    def backend_check(self, data):
+        if set(data) != {"origin"}:
+            raise SetupError("Provide only the public Express API origin.")
+        origin = public_origin(data["origin"])
+        with self.lock:
+            if self.preview or self.stopping:
+                raise SetupError("Readiness checks require this Pi's real setup session. Preview sends no network requests.")
+            if self.backend_busy:
+                raise SetupError("An API check is already in progress.")
+            if self.presence_session and self.presence_session.running and origin != self.backend["origin"]:
+                raise SetupError("Stop setup check-ins before changing the Express API address.")
+            self.backend_busy = True
+        try:
+            result = check_backend(origin)
+            with self.lock:
+                self.backend = result
+                return {"backend": dict(result)}
+        finally:
+            with self.lock:
+                self.backend_busy = False
 
     def scan(self):
         with self.lock:
@@ -82,7 +219,7 @@ class Application:
             if not network or time.monotonic() - self.scanned_at > 60:
                 raise SetupError("Scan again and choose a recently observed network.")
             self.busy = True
-            self.task = {"state": "connecting", "message": "Trying the selected network with rollback protection."}
+            self.task = {"state": "connecting", "message": "Complete any requested OS Wi-Fi authentication in the Pi dialog or authorization terminal. Then the selected network will be tried with rollback protection."}
         # The password exists only in this request/worker and nmcli stdin. It is
         # never part of task state, errors, persistence, logs or a command line.
         def worker():
@@ -108,7 +245,10 @@ class Application:
             except Exception as error:
                 with self.lock:
                     self.task = {"state": "unknown" if isinstance(error, RecoveryUnverified) else "failed",
-                                 "message": "Connection did not complete. Rollback was requested; verify the original network before retrying."}
+                                 "message": str(error) if isinstance(error, SetupError) else
+                                 "Connection did not complete. Rollback was requested; verify the original network before retrying."}
+                    if not self.manager.allow_changes:
+                        self.connection_message = self.task["message"]
             finally:
                 data["password"] = ""
                 with self.lock:
@@ -150,6 +290,7 @@ class Application:
     def close(self):
         with self.lock:
             self.stopping = True
+        self.presence_stop()
         self.rollback()
 
 
@@ -217,7 +358,10 @@ class Handler(BaseHTTPRequestHandler):
         app = self.server.app
         if not self.valid_host() or self.headers.get_all("Origin", []) != [self.server.origin]:
             return self.reply(403, {"error": "Same-origin local browser required."})
-        if len(self.headers.get_all("Authorization", [])) != 1 or time.monotonic() >= app.expires or not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + app.token):
+        # Recovery may open the desktop browser, but cannot return a bearer or
+        # perform device operations. Host/Origin/framing checks still apply.
+        recovery = self.path == "/api/session/reopen"
+        if not recovery and (len(self.headers.get_all("Authorization", [])) != 1 or time.monotonic() >= app.expires or not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + app.token)):
             return self.reply(401, {"error": "Setup session expired or unauthorized. Reopen the local setup app."})
         try:
             if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
@@ -238,11 +382,21 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw, object_pairs_hook=unique_pairs)
             if not isinstance(data, dict):
                 raise SetupError("Invalid request.")
-            if self.path != "/api/connect" and data:
+            if self.path not in ("/api/connect", "/api/authorize", "/api/backend-check", "/api/presence/start") and data:
                 raise SetupError("Unexpected request fields.")
             methods = {"/api/status": app.status, "/api/scan": app.scan, "/api/keep": app.keep, "/api/rollback": app.rollback}
-            if self.path == "/api/connect":
+            if recovery:
+                result = app.reopen_session(self.server.origin)
+            elif self.path == "/api/connect":
                 result = app.connect(data)
+            elif self.path == "/api/authorize":
+                result = app.authorize(data)
+            elif self.path == "/api/backend-check":
+                result = app.backend_check(data)
+            elif self.path == "/api/presence/start":
+                result = app.presence_start(data)
+            elif self.path == "/api/presence/stop":
+                result = app.presence_stop()
             elif self.path in methods:
                 result = methods[self.path]()
             else:
@@ -259,12 +413,14 @@ def main(device_id=None):
     parser.add_argument("--preview", action="store_true", help="Windows-safe UI only; no Wi-Fi commands")
     parser.add_argument("--interface", default="wlan0", help="Independently verified Wi-Fi interface")
     parser.add_argument("--allow-network-changes", action="store_true", help="Explicit operator-approved NetworkManager trials")
+    parser.add_argument("--backend-url", help="Public Express API origin to prefill; never saved or contacted automatically")
+    parser.add_argument("--presence-env", action="append", help="Existing private device env file path; repeat for up to three files. Read only after check-in approval.")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--device", choices=list(DEVICES), default=device_id or "GPS-001")
+    parser.add_argument("--device", choices=list(DEVICES), default=device_id or "GPS-002")
     args = parser.parse_args()
-    if device_id and args.device != device_id:
+    if args.device != (device_id or "GPS-002"):
         parser.error("This package belongs to a different Pi.")
-    if not 1024 <= args.port <= 65535 or args.preview and args.allow_network_changes:
+    if not 1024 <= args.port <= 65535 or args.preview and (args.allow_network_changes or args.presence_env) or len(args.presence_env or ()) > 3:
         parser.error("Invalid port or unsafe preview options.")
     manager = None
     lock = None
@@ -287,7 +443,11 @@ def main(device_id=None):
             manager.verify()
         except (OSError, SetupError):
             parser.error("Setup already open or verified NetworkManager/interface unavailable. Nothing was changed.")
-    app = Application(args.device, manager, preview=args.preview)
+    try:
+        presence_env = args.presence_env if args.presence_env is not None else (() if args.preview else default_config_files(args.device))
+        app = Application(args.device, manager, preview=args.preview, backend_origin=args.backend_url, presence_env=presence_env)
+    except SetupError as error:
+        parser.error(str(error))
     server = Server(app, args.port)
     # Token goes only into a loopback URL fragment, never the HTTP request, logs,
     # output, a file or cloud storage. JS removes the fragment before rendering.

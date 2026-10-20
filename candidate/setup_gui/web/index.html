@@ -1,21 +1,42 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CentraBus · Pi Setup</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CentraBus · Pi Setup</title><link rel="stylesheet" href="./style.css"><script defer src="./app.js"></script></head>
 <body><main>
   <header><div class="brand">Centra<span>BUS</span></div><span class="pill">Local device setup</span></header>
   <section class="intro"><p class="eyebrow" id="identity">Raspberry Pi configuration</p><h1>Let’s get connected.</h1><p>Choose a Wi-Fi network for this Pi. GPS monitoring stays untouched.</p></section>
-  <p id="notice" class="notice" role="status">Opening your local setup session…</p>
-  <section class="card"><div class="heading"><h2>Connection overview</h2><button id="refresh" class="secondary" type="button">Refresh status</button></div><dl class="status-grid"><div><dt>Wi-Fi</dt><dd id="wifi">Unknown</dd></div><div><dt>Internet · manager report</dt><dd id="internet">Unknown</dd></div><div><dt>Network manager</dt><dd id="manager">Not checked</dd></div></dl><p class="hint">Internet is NetworkManager’s last connectivity report, not a new Internet probe. Unknown is never assumed connected.</p></section>
+  <p id="notice" class="notice" role="status">Start setup-pi.py to open your local setup session.</p>
+  <noscript><p class="notice error">JavaScript is required. Enable it, then open the page through setup-pi.py on this Pi.</p></noscript>
+  <section id="session-recovery" class="card" hidden><h2 id="session-title">Reopen your setup session</h2>
+    <p id="session-message" role="status">Reloading clears this tab’s private session. Open a fresh setup window on this Pi to continue.</p>
+    <button id="session-reopen" type="button">Open fresh setup window</button>
+    <p id="launch-instructions" class="hint" hidden>From the package folder in this Pi’s desktop terminal, run <code>python3 setup-pi.py</code>. Use the browser window it opens. Opening this HTML file alone does not start a setup session.</p>
+    <p class="hint">The new window opens on this Pi. If no window opens, close the setup process and launch setup-pi.py again from the Pi desktop terminal. Wi-Fi and GPS services stay unchanged.</p>
+  </section>
+  <section class="card"><div class="heading"><h2>Connection overview</h2><button id="refresh" class="secondary" type="button" disabled>Refresh status</button></div><dl class="status-grid"><div><dt>Wi-Fi</dt><dd id="wifi">Unknown</dd></div><div><dt>Internet · manager report</dt><dd id="internet">Unknown</dd></div><div><dt>Network manager</dt><dd id="manager">Not checked</dd></div></dl><p class="hint">Internet is NetworkManager’s last connectivity report, not a new Internet probe. Unknown is never assumed connected.</p></section>
   <div class="columns">
-    <section class="card"><div class="heading"><div><h2>Nearby Wi-Fi</h2><p>Networks visible to this Pi.</p></div><button id="scan" type="button">Scan networks</button></div><p id="scan-status" class="hint" role="status">Select Scan to find available networks.</p><div id="networks" class="networks" role="radiogroup" aria-label="Available Wi-Fi networks"></div></section>
-    <section class="card"><h2>Connect a network</h2><p class="hint">Select a network on the left, then enter its password.</p><form id="connect-form" autocomplete="off">
+    <section class="card"><div class="heading"><div><h2>Nearby Wi-Fi</h2><p>Networks visible to this Pi.</p></div><button id="scan" type="button" disabled>Scan networks</button></div><p id="scan-status" class="hint" role="status">Select Scan to find available networks.</p><div id="networks" class="networks" role="radiogroup" aria-label="Available Wi-Fi networks"></div></section>
+    <section class="card"><h2>Connect a network</h2><p id="connection-help" class="hint" role="status">Enable connections, then select a network and enter its password.</p>
+      <div id="enable-panel"><label class="check"><input id="enable-confirm" type="checkbox">I am at this Pi and approve Wi-Fi connection trials with rollback protection.</label><button id="enable" type="button" disabled>Enable connections</button><p class="hint">Complete OS authentication in the Pi dialog or the CentraBus OS Wi-Fi authorization terminal. Never enter an OS administrator password into this page.</p></div>
+      <form id="connect-form" autocomplete="off">
       <label for="ssid">Selected network</label><input id="ssid" readonly placeholder="Choose from the scan results">
       <label for="password">Wi-Fi password</label><input id="password" type="password" maxlength="64" autocomplete="new-password" spellcheck="false" disabled>
       <p class="hint">Never stored by this page. A confirmed connection may be saved by the Pi’s existing OS network manager in its private local profile.</p>
       <label for="priority">Preferred priority · 0–100</label><input id="priority" type="number" min="0" max="100" step="1" value="50">
       <label class="check"><input id="confirm" type="checkbox">I am at this Pi and approve a temporary Wi-Fi switch. I can verify or roll back the connection.</label>
-      <button id="connect" class="wide" type="submit" disabled>Connect with rollback protection</button>
+      <button id="connect" class="wide" type="submit" disabled>Enable connections first</button>
     </form></section>
   </div>
   <section class="card"><div class="heading"><h2>Connection trial</h2><span id="trial-state" class="pill">Idle</span></div><p id="trial-message">No changes requested.</p><p id="countdown" class="hint"></p><div class="actions"><button id="keep" type="button" disabled>Keep this connection</button><button id="rollback" type="button" class="secondary" disabled>Roll back</button></div><p class="hint">If you do not confirm, NetworkManager’s checkpoint timer requests restoration. “Rolled back” is shown only after the original connection is observed again.</p></section>
-  <footer>Only this device · No cloud credentials · No GPS, camera or service changes<br>This is not the CentraBus administrator dashboard. Fully offline first-time provisioning and remote dashboard Wi-Fi delivery are separate integration steps.</footer>
+  <section class="card"><div class="heading"><h2>Backend and dashboard</h2><span id="backend-state" class="pill">Not checked</span></div>
+    <p id="backend-message" role="status">Wi-Fi alone does not verify the Express API or Supabase delivery.</p>
+    <dl class="status-grid"><div><dt>Backend mode</dt><dd id="backend-mode">Not checked</dd></div><div><dt>GPS writes on backend</dt><dd id="gps-state">Not checked</dd></div><div><dt>Setup online · authenticated check-in</dt><dd id="presence-state">Not configured</dd></div><div><dt>GPS freshness</dt><dd id="gps-freshness">Not checked by Wi-Fi setup</dd></div></dl>
+    <p id="presence-message" class="hint" role="status">This app has not sent an authenticated setup check-in.</p>
+    <p id="presence-time" class="hint"></p>
+    <form id="backend-form" autocomplete="off"><label for="backend-origin">Express API address</label><input id="backend-origin" type="text" maxlength="2048" spellcheck="false" placeholder="http://LAPTOP-PRIVATE-IP:5000">
+      <p class="hint">Use the backend/API address, not the dashboard page. A verified API address is remembered in this browser for this device; passwords and secrets are never stored here. This check sends no credentials or GPS and does not change the sender configuration.</p><button id="backend-check" type="submit" disabled>Check Express API</button></form>
+    <p id="backend-time" class="hint"></p><p class="hint">A ready API does not prove authenticated setup presence or fresh GPS delivery. Setup presence needs a verified check-in; GPS delivery needs a separate sender test.</p>
+    <label class="check"><input id="presence-confirm" type="checkbox">I approve authenticated setup-only check-ins to this Express API using this Pi’s existing private device configuration.</label>
+    <div class="actions"><button id="presence-start" type="button" disabled>Start check-ins</button><button id="presence-stop" class="secondary" type="button" disabled>Stop check-ins</button></div>
+    <p class="hint">Check-ins report this Pi’s setup presence about every 15 seconds. They do not start GPS uploads. After stopping, backend presence expires within 45 seconds of the last accepted check-in.</p>
+  </section>
+  <footer>Only this device · Device secret stays on this Pi · No GPS, camera or service changes<br>This is not the CentraBus administrator dashboard. Fully offline first-time provisioning and remote dashboard Wi-Fi delivery are separate integration steps.</footer>
 </main></body></html>

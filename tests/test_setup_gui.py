@@ -12,8 +12,10 @@ from unittest.mock import Mock, patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'candidate/setup_gui'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'candidate/gps'))
 import network
 import server
+import backend
 
 BASE = "11111111-1111-4111-8111-111111111111"
 SECRET = "synthetic-test-password"
@@ -51,6 +53,9 @@ class FakeManager(network.NetworkManager):
         self.checkpoints.append(item)
         return item
 
+    def permissions(self):
+        return {permission: self.permission for permission in network.PERMISSIONS}
+
     def response(self, args, **kwargs):
         self.calls.append((args, kwargs))
         if "RUNNING" in args:
@@ -75,6 +80,136 @@ class FakeManager(network.NetworkManager):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_explicit_authorization_tests_checkpoint_without_changing_a_profile(self):
+        item = FakeManager(False)
+        item.authorize()
+        self.assertTrue(item.allow_changes)
+        self.assertEqual(item.active, BASE)
+        self.assertEqual(item.checkpoints[0].answers, [True])
+        self.assertFalse(any("add" in args or "up" in args or "modify" in args or "delete" in args
+                             for args, _ in item.calls))
+
+    def test_auth_permission_uses_native_agent_then_rechecks_before_checkpoint(self):
+        item = FakeManager(False); item.permission = "auth"
+        with patch.object(network, "authorize_permission", side_effect=lambda action: setattr(item, "permission", "yes")) as auth:
+            item.authorize()
+        auth.assert_called_once_with(network.PERMISSIONS[0])
+        self.assertTrue(item.allow_changes)
+
+    def test_cancelled_native_auth_and_denied_policy_never_enable_connections(self):
+        for permission in ("auth", "no"):
+            item = FakeManager(False); item.permission = permission
+            with patch.object(network, "authorize_permission", side_effect=network.SetupError("OS authorization cancelled.")):
+                with self.assertRaises(network.SetupError): item.authorize()
+            self.assertFalse(item.allow_changes)
+            self.assertFalse(item.checkpoints)
+            self.assertFalse(any("add" in args or "up" in args for args, _ in item.calls))
+
+    def test_native_auth_is_one_bounded_os_prompt_without_password_or_policy_edit(self):
+        with patch.object(network.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as run:
+            network.authorize_permission(network.PERMISSIONS[-1])
+        args = run.call_args.args[0]
+        self.assertEqual(args[0], "/usr/bin/pkcheck")
+        self.assertIn("--allow-user-interaction", args)
+        self.assertEqual(len(args[args.index("--process") + 1].split(",")), 3)
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["timeout"], 40)
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_expired_authorization_is_renewed_before_any_connection_write(self):
+        item = FakeManager(); item.permission = "auth"
+        def approve(action):
+            self.assertFalse(item.checkpoints)
+            self.assertFalse(any("add" in args or "up" in args for args, _ in item.calls))
+            item.permission = "yes"
+        with patch.object(network, "authorize_permission", side_effect=approve) as auth:
+            trial = item.begin(AP, SECRET, 50)
+        auth.assert_called_once_with(network.PERMISSIONS[0])
+        self.assertTrue(item.allow_changes)
+        self.assertTrue(trial.checkpoint.alive())
+        trial.rollback()
+
+    def test_cancelled_renewal_returns_to_enable_flow_without_any_write(self):
+        item = FakeManager(); item.permission = "auth"
+        with patch.object(network, "authorize_permission", side_effect=network.SetupError("OS authorization cancelled.")):
+            with self.assertRaisesRegex(network.SetupError, "cancelled"):
+                item.begin(AP, SECRET, 50)
+        self.assertFalse(item.allow_changes)
+        self.assertFalse(item.checkpoints)
+        self.assertFalse(any("add" in args or "up" in args for args, _ in item.calls))
+
+    def test_renewal_prompts_once_and_requires_native_permission_confirmation(self):
+        item = FakeManager(); item.permission = "auth"
+        with patch.object(network, "authorize_permission") as auth:
+            with self.assertRaisesRegex(network.SetupError, "Additional OS authorization"):
+                item.begin(AP, SECRET, 50)
+        auth.assert_called_once_with(network.PERMISSIONS[0])
+        self.assertFalse(item.allow_changes)
+        self.assertFalse(item.checkpoints)
+        self.assertFalse(any("add" in args or "up" in args for args, _ in item.calls))
+
+    def test_changed_or_lost_fallback_during_renewal_never_creates_a_profile(self):
+        for connected, profile_id in [(True, "22222222-2222-4222-8222-222222222222"), (False, None)]:
+            with self.subTest(connected=connected):
+                item = FakeManager(); item.permission = "auth"
+                def approve(action):
+                    item.permission = "yes"
+                with patch.object(network, "authorize_permission", side_effect=approve), patch.object(item, "status", side_effect=[
+                        {"connected": True, "profile_id": BASE}, {"connected": connected, "profile_id": profile_id}]):
+                    with self.assertRaisesRegex(network.SetupError, "Wi-Fi changed"):
+                        item.begin(AP, SECRET, 50)
+                self.assertFalse(item.allow_changes)
+                self.assertFalse(item.checkpoints)
+                self.assertFalse(any("add" in args or "up" in args for args, _ in item.calls))
+
+    def test_existing_permission_needs_no_renewal_prompt(self):
+        item = FakeManager()
+        with patch.object(network, "authorize_permission") as auth:
+            trial = item.begin(AP, SECRET, 50)
+        auth.assert_not_called()
+        trial.rollback()
+
+    def test_expired_checkpoint_permission_is_renewed_for_the_native_caller(self):
+        item = FakeManager()
+        before = {action: "yes" for action in network.PERMISSIONS}
+        before[network.PERMISSIONS[-1]] = "auth"
+        with patch.object(item, "permissions", side_effect=[before, {action: "yes" for action in network.PERMISSIONS}]), \
+                patch.object(network, "authorize_permission") as auth:
+            trial = item.begin(AP, SECRET, 50)
+        auth.assert_called_once_with(network.PERMISSIONS[-1])
+        self.assertTrue(trial.checkpoint.alive())
+        trial.rollback()
+
+    def test_read_only_never_requests_renewal(self):
+        item = FakeManager(False); item.permission = "auth"
+        with patch.object(network, "authorize_permission") as auth, self.assertRaises(network.SetupError):
+            item.begin(AP, SECRET, 50)
+        auth.assert_not_called()
+        self.assertFalse(item.allow_changes)
+        self.assertFalse(item.checkpoints)
+
+    def test_missing_graphical_agent_uses_native_terminal_then_rechecks_authorization(self):
+        results = [types.SimpleNamespace(returncode=2), types.SimpleNamespace(returncode=0), types.SimpleNamespace(returncode=0)]
+        with patch.object(network.subprocess, "run", side_effect=results) as run, patch('pathlib.Path.is_file', return_value=True):
+            network.authorize_permission(network.PERMISSIONS[-1])
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[1][0:2], ["/usr/bin/lxterminal", "--no-remote"])
+        self.assertIn("--enable-internal-agent", commands[1][-1])
+        self.assertNotIn("--allow-user-interaction", commands[2])
+        self.assertTrue(all(call.kwargs["stdin"] == subprocess.DEVNULL for call in run.call_args_list))
+
+    def test_terminal_exit_alone_is_not_authorization_success(self):
+        results = [types.SimpleNamespace(returncode=2), types.SimpleNamespace(returncode=0), types.SimpleNamespace(returncode=2)]
+        with patch.object(network.subprocess, "run", side_effect=results), patch('pathlib.Path.is_file', return_value=True):
+            with self.assertRaises(network.SetupError):
+                network.authorize_permission(network.PERMISSIONS[-1])
+
+    def test_missing_desktop_terminal_fails_without_installing_or_prompting_elsewhere(self):
+        with patch.object(network.subprocess, 'run', return_value=types.SimpleNamespace(returncode=2)) as run, patch('pathlib.Path.is_file', return_value=False):
+            with self.assertRaises(network.SetupError): network.authorize_permission(network.PERMISSIONS[-1])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][0], '/usr/bin/pkcheck')
+
     def test_scan_preserves_escaped_ssid_and_deduplicates_best_ap(self):
         item = FakeManager()
         results = item.scan()
@@ -83,6 +218,28 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(depot["signal"], 80)
         self.assertEqual(depot["bssid"], AP["bssid"])
         self.assertEqual(results[0]["security"], "unsupported")
+
+    def test_weaker_connected_ap_survives_stronger_duplicate_in_either_order(self):
+        active = "*:Depot:AA\\:BB\\:CC\\:DD\\:EE\\:01:30:WPA2"
+        stronger = ":Depot:AA\\:BB\\:CC\\:DD\\:EE\\:02:95:WPA2"
+        for rows in ((active, stronger), (stronger, active)):
+            item = FakeManager()
+            original = item.response
+            item.run = lambda args, **kwargs: "\n".join(rows) if "IN-USE,SSID,BSSID,SIGNAL,SECURITY" in args else original(args, **kwargs)
+            result = item.scan()
+            self.assertEqual(len(result), 1)
+            self.assertIs(result[0]["connected"], True)
+            self.assertEqual(result[0]["bssid"], "AA:BB:CC:DD:EE:01")
+            self.assertEqual(result[0]["signal"], 30)
+
+    def test_disconnected_duplicate_aps_still_select_the_strongest(self):
+        item = FakeManager()
+        original = item.response
+        item.run = lambda args, **kwargs: ":Depot:AA\\:BB\\:CC\\:DD\\:EE\\:01:20:WPA2\n:Depot:AA\\:BB\\:CC\\:DD\\:EE\\:02:90:WPA2" if "IN-USE,SSID,BSSID,SIGNAL,SECURITY" in args else original(args, **kwargs)
+        result = item.scan()
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0]["connected"])
+        self.assertEqual(result[0]["signal"], 90)
 
     def test_status_is_real_manager_observation_not_gps(self):
         self.assertEqual(FakeManager().status()["profile_id"], BASE)
@@ -111,9 +268,10 @@ class NetworkTests(unittest.TestCase):
             self.assertFalse(item.calls)
 
     def test_existing_permission_denial_never_creates_checkpoint_or_profile(self):
-        item = FakeManager(); item.permission = "auth"
-        with self.assertRaises(network.SetupError):
+        item = FakeManager(); item.permission = "no"
+        with patch.object(network, "authorize_permission") as auth, self.assertRaises(network.SetupError):
             item.begin(AP, SECRET, 50)
+        auth.assert_not_called()
         self.assertFalse(item.checkpoints)
         self.assertFalse(any("add" in args for args, _ in item.calls))
 
@@ -134,6 +292,43 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(trial.finished)
         self.assertFalse(trial.rollback())
         self.assertFalse(any(BASE in args and ("modify" in args or "delete" in args) for args, _ in item.calls))
+
+    def test_unconfirmed_keep_can_roll_back_and_disables_only_trial_autoconnect(self):
+        item = FakeManager(); trial = item.begin(AP, SECRET, 50)
+        reply = trial.checkpoint.reply
+        trial.checkpoint.reply = lambda keep: False if keep else reply(False)
+        with self.assertRaises(network.SetupError): trial.commit()
+        self.assertFalse(trial.finished)
+        self.assertTrue(trial.rollback())
+        self.assertEqual(item.active, BASE)
+        self.assertTrue(any("modify" in args and trial.profile_id in args and args[-2:] == ["connection.autoconnect", "no"] for args, _ in item.calls))
+        self.assertFalse(any(BASE in args and ("modify" in args or "delete" in args) for args, _ in item.calls))
+
+    def test_rollback_cleanup_failure_is_unknown_even_after_original_profile_returns(self):
+        item = FakeManager(); trial = item.begin(AP, SECRET, 50)
+        original = item.run
+        def reject_cleanup(args, **kwargs):
+            if "delete" in args:
+                raise network.SetupError("Cleanup not confirmed")
+            return original(args, **kwargs)
+        item.run = reject_cleanup
+        self.assertFalse(trial.rollback())
+        self.assertEqual(item.active, BASE)
+
+    def test_keep_command_timeout_after_apply_still_disables_trial_autoconnect(self):
+        item = FakeManager(); trial = item.begin(AP, SECRET, 50)
+        original = item.run
+        def uncertain_keep(args, **kwargs):
+            result = original(args, **kwargs)
+            if "modify" in args and "yes" in args:
+                raise network.SetupError("Command timed out after an unknown apply outcome")
+            return result
+        item.run = uncertain_keep
+        with self.assertRaises(network.SetupError): trial.commit()
+        self.assertFalse(trial.finished)
+        self.assertTrue(trial.rollback())
+        self.assertEqual(item.active, BASE)
+        self.assertTrue(any("modify" in args and trial.profile_id in args and args[-2:] == ["connection.autoconnect", "no"] for args, _ in item.calls))
 
     def test_password_not_argv_and_no_shell_or_credential_file(self):
         item = FakeManager(); trial = item.begin(AP, SECRET, 50)
@@ -180,21 +375,114 @@ class NetworkTests(unittest.TestCase):
             self.assertEqual(network.run_command(["/usr/bin/nmcli"], secret=SECRET), "")
             self.assertFalse(run.call_args.kwargs["shell"])
 
-    def test_checkpoint_does_not_run_when_unsupported_and_no_secret_in_argv(self):
-        process = Mock(stdin=Mock(), stdout=io.StringIO("unsupported\n"), returncode=1)
-        process.poll.return_value = 1
-        popen = Mock(return_value=process)
-        with self.assertRaises(network.SetupError):
-            network.Checkpoint("/usr/bin/nmcli", "wlan0", popen=popen)
-        self.assertIn("checkpoint", popen.call_args.args[0])
-        self.assertNotIn(SECRET, repr(popen.call_args))
+    def test_authorized_gui_is_not_rechecked_via_an_unauthorized_child_process(self):
+        fixture = FakeManager(False)
+        before = {action: "yes" for action in network.PERMISSIONS}; before[network.PERMISSIONS[-1]] = "auth"
+        native = Mock()
+        native.permissions.side_effect = [before, {action: "yes" for action in network.PERMISSIONS}]
+        native.device_path.return_value = "/org/freedesktop/NetworkManager/Devices/2"
+        native.create.return_value = "/org/freedesktop/NetworkManager/Checkpoint/7"
+        native.exists.return_value = True
+        item = network.NetworkManager("wlan0", runner=fixture.response, native_client=native)
+        with patch.object(network, "authorize_permission") as auth, patch.object(network.subprocess, "Popen") as spawn:
+            item.authorize()
+        auth.assert_called_once_with(network.PERMISSIONS[-1])
+        self.assertTrue(item.allow_changes)
+        spawn.assert_not_called()
+        self.assertFalse(any("PERMISSION,VALUE" in args for args, _ in fixture.calls))
+        native.create.assert_called_once_with(native.device_path.return_value)
+        native.destroy.assert_called_once_with(native.create.return_value)
 
-    def test_checkpoint_waits_for_ready_and_uses_exact_yes_no(self):
-        process = Mock(stdin=Mock(), stdout=io.StringIO("CENTRABUS_CHECKPOINT_READY\n"), returncode=0)
-        process.poll.return_value = None
-        item = network.Checkpoint("/usr/bin/nmcli", "wlan0", popen=lambda *a, **k: process)
-        self.assertTrue(item.alive())
-        self.assertTrue(item.reply(False)); process.stdin.write.assert_called_once_with("No\n")
+    def test_native_checkpoint_failures_never_enable_connection_changes(self):
+        fixture = FakeManager(False)
+        native = Mock()
+        native.permissions.return_value = {action: "yes" for action in network.PERMISSIONS}
+        native.create.side_effect = network.SetupError("Native rollback access unavailable.")
+        item = network.NetworkManager("wlan0", runner=fixture.response, native_client=native)
+        with self.assertRaises(network.SetupError): item.authorize()
+        self.assertFalse(item.allow_changes)
+        self.assertFalse(any("add" in args for args, _ in fixture.calls))
+
+    def test_command_profile_permissions_are_checked_without_requiring_child_checkpoint_auth(self):
+        item = FakeManager()
+        original = item.response
+        def response(args, **kwargs):
+            if "PERMISSION,VALUE" in args:
+                return "\n".join(action + ":" + ("auth" if action == network.PERMISSIONS[-1] else "yes")
+                                 for action in network.PERMISSIONS)
+            return original(args, **kwargs)
+        item.run = response
+        trial = item.begin(AP, SECRET, 50)
+        self.assertTrue(trial.checkpoint.alive())
+        self.assertTrue(trial.rollback())
+
+
+class NativeCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        self.device = "/org/freedesktop/NetworkManager/Devices/2"
+        self.path = "/org/freedesktop/NetworkManager/Checkpoint/7"
+        self.client = Mock()
+        self.client.device_path.return_value = self.device
+        self.client.create.return_value = self.path
+        self.client.exists.return_value = True
+        self.client.rollback.return_value = {self.device: 0}
+
+    def test_keep_destroys_only_owned_checkpoint_using_same_native_client(self):
+        checkpoint = network.Checkpoint(self.client, "wlan0")
+        self.assertTrue(checkpoint.alive())
+        self.assertTrue(checkpoint.reply(True))
+        self.client.device_path.assert_called_once_with("wlan0")
+        self.client.create.assert_called_once_with(self.device)
+        self.client.destroy.assert_called_once_with(self.path)
+        self.client.rollback.assert_not_called()
+        self.assertFalse(checkpoint.reply(True))
+
+    def test_expired_or_removed_checkpoint_never_commits(self):
+        for kind in ("expired", "removed"):
+            checkpoint = network.Checkpoint(self.client, "wlan0")
+            if kind == "expired": checkpoint.deadline = time.monotonic() - 1
+            else: self.client.exists.return_value = False
+            self.assertFalse(checkpoint.reply(True))
+        self.client.destroy.assert_not_called()
+
+    def test_rollback_requires_native_success_then_cleans_only_owned_checkpoint(self):
+        checkpoint = network.Checkpoint(self.client, "wlan0")
+        self.assertTrue(checkpoint.reply(False))
+        self.client.rollback.assert_called_once_with(self.path)
+        self.client.destroy.assert_called_once_with(self.path)
+
+    def test_bad_rollback_or_unavailable_bus_never_reports_success(self):
+        for result in ({}, {self.device: 1}, {self.device: False}):
+            self.client.rollback.return_value = result
+            checkpoint = network.Checkpoint(self.client, "wlan0")
+            self.assertFalse(checkpoint.reply(False))
+        self.client.destroy.assert_not_called()
+        self.client.exists.side_effect = network.SetupError("Unavailable")
+        self.assertFalse(network.Checkpoint(self.client, "wlan0").reply(False))
+
+    def test_native_bus_uses_exact_device_timer_and_no_destroy_all(self):
+        connection = Mock()
+        connection.call_sync.return_value.unpack.return_value = (self.path,)
+        client = network.NativeNetworkClient(connection=connection, variant_factory=lambda signature, arguments: (signature, arguments))
+        self.assertEqual(client.create(self.device), self.path)
+        call = connection.call_sync.call_args.args
+        self.assertEqual(call[3], "CheckpointCreate")
+        self.assertEqual(call[4], ("(aouu)", ([self.device], 90, 0)))
+        self.assertEqual(call[-2], 5000)
+        with self.assertRaises(network.SetupError): client.destroy("")
+        connection.call_sync.side_effect = RuntimeError(SECRET)
+        with self.assertRaises(network.SetupError) as error: client.permissions()
+        self.assertNotIn(SECRET, str(error.exception))
+
+    def test_native_permissions_are_read_through_the_same_in_process_bus(self):
+        connection = Mock()
+        permissions = {action: "yes" for action in network.PERMISSIONS}
+        connection.call_sync.return_value.unpack.return_value = (permissions,)
+        client = network.NativeNetworkClient(connection=connection)
+        self.assertEqual(client.permissions(), permissions)
+        self.assertEqual(connection.call_sync.call_args.args[3], "GetPermissions")
+        connection.call_sync.return_value.unpack.return_value = ({"action": "unexpected"},)
+        with self.assertRaises(network.SetupError): client.permissions()
 
 
 class ApplicationTests(unittest.TestCase):
@@ -204,6 +492,46 @@ class ApplicationTests(unittest.TestCase):
 
     def tearDown(self):
         self.app.close()
+
+    def wait_reopen(self):
+        limit = time.monotonic() + 2
+        while self.app.reopening and time.monotonic() < limit:
+            time.sleep(.005)
+        self.assertFalse(self.app.reopening)
+
+    def test_reload_recovery_opens_only_desktop_browser_and_keeps_valid_session(self):
+        token = self.app.token
+        with patch.object(server.webbrowser, 'open', return_value=True) as browser:
+            result = self.app.reopen_session('http://127.0.0.1:8765')
+            self.wait_reopen()
+        self.assertEqual(result, {'accepted': True})
+        self.assertEqual(self.app.token, token)
+        browser.assert_called_once_with('http://127.0.0.1:8765/#' + token, new=1)
+        self.assertNotIn(token, json.dumps(result))
+        self.assertEqual(self.manager.active, BASE)
+        self.assertFalse(self.manager.checkpoints)
+        self.assertIsNone(self.app.presence_session)
+
+    def test_expired_recovery_renews_only_browser_session_without_device_operations(self):
+        old = self.app.token
+        self.app.expires = time.monotonic() - 1
+        with patch.object(server.webbrowser, 'open', return_value=True) as browser, patch.object(server.secrets, 'token_urlsafe', return_value='synthetic-new-session'):
+            result = self.app.reopen_session('http://127.0.0.1:8765')
+            self.wait_reopen()
+        self.assertNotEqual(self.app.token, old)
+        self.assertGreater(self.app.expires, time.monotonic() + 1790)
+        browser.assert_called_once_with('http://127.0.0.1:8765/#synthetic-new-session', new=1)
+        self.assertEqual(result, {'accepted': True})
+        self.assertIsNone(self.app.presence_session)
+        self.assertFalse(self.manager.calls)
+
+    def test_recovery_is_rate_limited_and_unavailable_while_closing(self):
+        with patch.object(server.webbrowser, 'open', side_effect=RuntimeError('synthetic-private-url')) as browser:
+            self.app.reopen_session('http://127.0.0.1:8765'); self.wait_reopen()
+            with self.assertRaises(network.SetupError): self.app.reopen_session('http://127.0.0.1:8765')
+            self.app.stopping = True
+            with self.assertRaises(network.SetupError): self.app.reopen_session('http://127.0.0.1:8765')
+        browser.assert_called_once()
 
     def payload(self):
         choices = self.app.scan()["networks"]
@@ -222,6 +550,118 @@ class ApplicationTests(unittest.TestCase):
         self.assertFalse(app.status()["changesEnabled"])
         with self.assertRaises(network.SetupError):
             app.scan()
+
+    def test_default_read_only_can_be_explicitly_enabled_in_same_browser_session(self):
+        self.manager.allow_changes = False
+        self.assertFalse(self.app.status()["changesEnabled"])
+        self.app.authorize({"confirmed": True}); self.wait_trial()
+        self.assertTrue(self.app.status()["changesEnabled"])
+        self.assertEqual(self.manager.active, BASE)
+        self.app.connect(self.payload()); self.wait_trial()
+        self.assertEqual(self.app.status()["task"]["state"], "awaiting_confirmation")
+
+    def test_authorization_failure_is_visible_and_no_os_password_is_requested_by_page(self):
+        self.manager.allow_changes = False
+        with patch.object(self.manager, "authorize", side_effect=network.SetupError("Use the Pi desktop terminal.")):
+            self.app.authorize({"confirmed": True}); self.wait_trial()
+        status = self.app.status()
+        self.assertFalse(status["changesEnabled"])
+        self.assertIn("desktop terminal", status["connectionMessage"])
+        self.assertEqual(status["task"]["state"], "failed")
+
+    def test_cancelled_connect_renewal_replaces_stale_enabled_message(self):
+        self.manager.permission = "auth"
+        self.app.connection_message = "Connections enabled for this session."
+        with patch.object(network, "authorize_permission", side_effect=network.SetupError("OS authorization cancelled.")):
+            self.app.connect(self.payload()); self.wait_trial()
+        status = self.app.status()
+        self.assertFalse(status["changesEnabled"])
+        self.assertEqual(status["connectionMessage"], "OS authorization cancelled.")
+        self.assertEqual(status["task"]["state"], "failed")
+        self.assertFalse(self.manager.checkpoints)
+
+    def test_authorize_requires_exact_explicit_approval_and_never_runs_in_preview(self):
+        for payload in ({}, {"confirmed": False}, {"confirmed": True, "password": SECRET}):
+            with self.assertRaises(network.SetupError): self.app.authorize(payload)
+        app = server.Application("GPS-001", preview=True)
+        with self.assertRaises(network.SetupError): app.authorize({"confirmed": True})
+        with patch.object(server, "check_backend") as probe:
+            with self.assertRaises(network.SetupError): app.backend_check({"origin": "https://api.example.test"})
+        probe.assert_not_called()
+
+    def test_backend_check_updates_only_public_in_memory_status(self):
+        report = {"origin": "https://api.example.test", "state": "unreachable", "message": "API unreachable", "checkedAt": 100}
+        with patch.object(server, "check_backend", return_value=report) as probe:
+            self.assertEqual(self.app.backend_check({"origin": report["origin"]})["backend"], report)
+        probe.assert_called_once_with(report["origin"])
+        self.assertEqual(self.app.status()["backend"], report)
+        self.assertEqual(self.manager.active, BASE)
+        self.assertFalse(self.manager.calls and any("add" in args for args, _ in self.manager.calls))
+
+    def test_api_readiness_does_not_register_device_presence(self):
+        report = {"origin": "https://api.example.test", "state": "ready", "mode": "local-setup",
+                  "gpsPersistenceEnabled": False, "setupPresenceEnabled": True}
+        with patch.object(server, "check_backend", return_value=report):
+            self.app.backend_check({"origin": report["origin"]})
+        status = self.app.status()
+        self.assertEqual(status["backend"]["state"], "ready")
+        self.assertEqual(status["presence"]["state"], "not_configured")
+        self.assertIn("has not sent", status["presence"]["message"])
+        self.assertFalse(self.manager.calls and any("add" in args for args, _ in self.manager.calls))
+
+    def test_presence_requires_explicit_approval_config_and_fresh_presence_enabled_api(self):
+        with patch.object(server, "read_key") as read:
+            for payload in ({}, {"confirmed": False}, {"confirmed": True, "secret": SECRET}):
+                with self.assertRaises(network.SetupError): self.app.presence_start(payload)
+            with self.assertRaises(network.SetupError): self.app.presence_start({"confirmed": True})
+            self.app.presence_env = ("/synthetic-only.env",)
+            self.app.backend = {"state": "ready", "origin": "https://api.example.test", "checkedAt": time.time(),
+                                "setupPresenceEnabled": False}
+            with self.assertRaises(network.SetupError): self.app.presence_start({"confirmed": True})
+            self.app.backend.update(setupPresenceEnabled=True, checkedAt=time.time() - 61)
+            with self.assertRaises(network.SetupError): self.app.presence_start({"confirmed": True})
+            read.assert_not_called()
+
+    def test_presence_start_uses_only_existing_configuration_and_keeps_wifi_unchanged(self):
+        self.app.presence_env = ("/synthetic-only.env",)
+        self.app.backend = {"state": "ready", "origin": "https://api.example.test", "checkedAt": time.time(),
+                            "setupPresenceEnabled": True}
+        session = Mock(); session.running = True
+        session.status.return_value = {"state": "waiting", "running": True, "active": True}
+        with patch.object(server, "read_key", return_value=b'x' * 32) as read, patch.object(server, "PresenceClient") as client, patch.object(server, "PresenceSession", return_value=session):
+            self.app.presence_start({"confirmed": True})
+        read.assert_called_once_with(self.app.presence_env, "GPS-002")
+        client.assert_called_once_with("https://api.example.test", "GPS-002", b'x' * 32)
+        session.start.assert_called_once()
+        with self.assertRaises(network.SetupError): self.app.presence_start({"confirmed": True})
+        self.assertEqual(self.manager.active, BASE)
+        self.app.presence_stop(); session.stop.assert_called_once()
+
+    def test_windows_start_local_missing_readiness_flag_blocks_setup_online(self):
+        self.app.presence_env = ("/synthetic-only.env",)
+        self.app.backend = {**backend.readiness_report({"ready": True, "mode": "real-lan", "simulation": False,
+                            "gpsPersistenceEnabled": True, "scope": "backend-process-only"}),
+                            "origin": "https://api.example.test", "checkedAt": time.time()}
+        self.assertEqual(self.app.backend["state"], "ready")
+        self.assertFalse(self.app.status()["presence"]["canStart"])
+        with patch.object(server, "read_key") as read, patch.object(server, "PresenceClient") as client:
+            with self.assertRaises(network.SetupError): self.app.presence_start({"confirmed": True})
+        read.assert_not_called(); client.assert_not_called()
+
+    def test_api_destination_cannot_change_while_checkins_are_running(self):
+        self.app.backend = {"origin": "https://api.example.test"}
+        self.app.presence_session = Mock(running=True)
+        self.app.presence_session.status.return_value = {"state": "waiting", "running": True, "active": True}
+        with patch.object(server, "check_backend") as probe:
+            with self.assertRaises(network.SetupError):
+                self.app.backend_check({"origin": "https://different.example.test"})
+        probe.assert_not_called()
+
+    def test_old_network_observation_becomes_unknown_for_presence(self):
+        self.app.status()
+        self.assertTrue(self.app._presence_observation()["wifiConnected"])
+        self.app.observed_at -= 16
+        self.assertEqual(self.app._presence_observation(), {"wifiConnected": None, "internet": "unknown"})
 
     def test_scan_only_returns_whitelisted_metadata_and_no_bssid(self):
         result = self.app.scan()
@@ -277,10 +717,12 @@ class HttpTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.http.shutdown(); cls.http.server_close(); cls.app.close(); cls.thread.join(2)
 
-    def request(self, path="/api/status", data=None, headers=None, method="POST", raw=None):
+    def request(self, path="/api/status", data=None, headers=None, method="POST", raw=None, authenticated=True):
         conn = http.client.HTTPConnection("127.0.0.1", self.http.server_port, timeout=2)
         body = json.dumps(data or {}) if raw is None else raw
-        values = {"Origin": self.http.origin, "Authorization": "Bearer " + self.app.token, "Content-Type": "application/json"}
+        values = {"Origin": self.http.origin, "Content-Type": "application/json"}
+        if authenticated:
+            values['Authorization'] = 'Bearer ' + self.app.token
         values.update(headers or {})
         conn.request(method, path, body if method == "POST" else None, values)
         response = conn.getresponse(); result = (response.status, response.read(), dict(response.getheaders())); conn.close()
@@ -294,12 +736,38 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertNotIn(self.app.token.encode(), body)
+        for name, mime in (("style.css", "text/css"), ("app.js", "text/javascript")):
+            status, asset, headers = self.request('/' + name, method="GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(asset, (server.ASSETS / name).read_bytes())
+            self.assertTrue(headers['Content-Type'].startswith(mime))
 
     def test_status_authentication_and_origin(self):
         self.assertEqual(self.request()[0], 200)
         for headers in ({"Authorization": "Bearer wrong"}, {"Origin": "http://attacker.invalid"},
                         {"Host": "attacker.invalid"}, {"Origin": "null"}):
             self.assertIn(self.request(headers=headers)[0], (401, 403))
+
+    def test_recovery_without_bearer_opens_desktop_but_never_returns_session_token(self):
+        self.app.last_reopen = None
+        self.app.expires = time.monotonic() - 1
+        with patch.object(server.webbrowser, 'open', return_value=True) as browser:
+            status, body, _ = self.request('/api/session/reopen', authenticated=False)
+            limit = time.monotonic() + 2
+            while self.app.reopening and time.monotonic() < limit: time.sleep(.005)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {'accepted': True})
+        self.assertNotIn(self.app.token.encode(), body)
+        browser.assert_called_once_with(self.http.origin + '/#' + self.app.token, new=1)
+        self.assertEqual(self.request(authenticated=False)[0], 401)
+
+    def test_recovery_requires_exact_local_origin_host_and_empty_json(self):
+        with patch.object(server.webbrowser, 'open') as browser:
+            for headers in ({'Origin':'http://attacker.invalid'}, {'Origin':'null'}, {'Host':'attacker.invalid'}):
+                self.assertEqual(self.request('/api/session/reopen', headers=headers, authenticated=False)[0], 403)
+            self.assertEqual(self.request('/api/session/reopen', data={'token':'synthetic'}, authenticated=False)[0], 409)
+            self.assertEqual(self.request('/api/session/reopen', raw='[]', authenticated=False)[0], 409)
+        browser.assert_not_called()
 
     def test_no_traversal_or_unknown_paths(self):
         self.assertEqual(self.request("/../../network.py", method="GET")[0], 404)
@@ -322,14 +790,95 @@ class HttpTests(unittest.TestCase):
         data = {"networkId": "x", "password": SECRET, "priority": 50, "confirmed": True}
         status, body, _ = self.request("/api/connect", data=data)
         self.assertEqual(status, 409); self.assertNotIn(SECRET.encode(), body)
+        self.assertEqual(self.request("/api/authorize", data={"confirmed": True})[0], 409)
+        self.assertEqual(self.request("/api/backend-check", data={"origin": "https://api.example.test"})[0], 409)
+        self.assertEqual(self.request("/api/presence/start", data={"confirmed": True})[0], 409)
+        self.assertEqual(self.request("/api/presence/start", data={"confirmed": True}, headers={"Authorization": "Bearer wrong"})[0], 401)
 
-    def test_frontend_has_no_storage_or_password_logging_and_clears_dom(self):
+    def test_frontend_restricts_storage_to_public_origin_and_clears_password_dom(self):
         js = (server.ASSETS / "app.js").read_text()
-        self.assertNotIn("localStorage", js); self.assertNotIn("sessionStorage", js)
+        self.assertIn("localStorage.setItem(originKey(state.deviceId), origin)", js)
+        self.assertNotIn("sessionStorage", js)
         self.assertNotIn("console.", js); self.assertNotIn("innerHTML", js)
         self.assertIn("payload.password = ''", js)
         self.assertIn("history.replaceState", js)
         self.assertIn("pagehide", js)
+
+
+class BackendTests(unittest.TestCase):
+    def test_only_public_https_or_private_lan_origins_no_credentials_or_extra_paths(self):
+        self.assertEqual(backend.public_origin("http://192.168.1.5:5000/"), "http://192.168.1.5:5000")
+        self.assertEqual(backend.public_origin("https://API.example.test:443/"), "https://api.example.test")
+        for value in ("http://api.example.test", "http://127.0.0.1:8765", "http://169.254.1.1", "https://localhost",
+                      "http://192.168.1.5:5000/api/gps/update", "https://fixture:private-value@api.example.test",
+                      "https://api.example.test?key=private-value", "https://api.example.test#private-value", None):
+            with self.subTest(value=value), self.assertRaises(network.SetupError) as error:
+                backend.public_origin(value)
+            self.assertNotIn("private-value", str(error.exception))
+
+    def probe(self, payload):
+        response = Mock(status=200)
+        response.read.return_value = payload
+        response.__enter__ = Mock(return_value=response); response.__exit__ = Mock(return_value=False)
+        opener = Mock(); opener.open.return_value = response
+        with patch.object(backend, "build_opener", return_value=opener):
+            report = backend.check_backend("http://192.168.1.5:5000")
+        opener.open.assert_called_once_with("http://192.168.1.5:5000/readyz", timeout=5)
+        response.read.assert_called_once_with(4097)
+        return report
+
+    def test_ready_requires_strict_known_flags_and_does_not_claim_gps_ingestion(self):
+        flags = {"ready": True, "simulation": False, "gpsPersistenceEnabled": True, "scope": "backend-process-only"}
+        report = self.probe(json.dumps(flags).encode())
+        self.assertEqual(report["state"], "ready")
+        self.assertTrue(report["gpsPersistenceEnabled"])
+        self.assertIn("still unverified", report["message"])
+        for change in ({"ready": 1}, {"simulation": True}, {"gpsPersistenceEnabled": False}, {"scope": "unknown"}):
+            self.assertEqual(self.probe(json.dumps({**flags, **change}).encode())["state"], "unverified")
+        for payload in (b"[]", b"not json", b"x" * 4097):
+            self.assertEqual(self.probe(payload)["state"], "unverified")
+
+    def test_start_system_setup_api_can_be_ready_while_gps_writes_stay_disabled(self):
+        flags = {"ready": True, "mode": "local-setup", "simulation": False,
+                 "gpsPersistenceEnabled": False, "setupPresenceEnabled": True,
+                 "cameraEnabled": False, "wifiManagementEnabled": False}
+        for extra in ({}, {"scope": "backend-process-only"}):
+            report = self.probe(json.dumps({**flags, **extra}).encode())
+            self.assertEqual(report["state"], "ready")
+            self.assertEqual(report["mode"], "local-setup")
+            self.assertIs(report["gpsPersistenceEnabled"], False)
+            self.assertIn("GPS writes are disabled", report["message"])
+            self.assertIn("still unverified", report["message"])
+        for change in ({"mode": "unknown"}, {"gpsPersistenceEnabled": True}, {"setupPresenceEnabled": False},
+                       {"setupPresenceEnabled": 1}, {"scope": "end-to-end"}, {"simulation": True}, {"ready": 1}):
+            with self.subTest(change=change):
+                report = self.probe(json.dumps({**flags, **change}).encode())
+                self.assertEqual(report["state"], "unverified")
+                self.assertIsNone(report["gpsPersistenceEnabled"])
+
+    def test_start_local_gps_api_still_requires_the_process_scope(self):
+        flags = {"ready": True, "mode": "real-lan", "simulation": False,
+                 "gpsPersistenceEnabled": True, "scope": "backend-process-only"}
+        report = self.probe(json.dumps(flags).encode())
+        self.assertEqual(report["state"], "ready")
+        self.assertEqual(report["mode"], "real-lan")
+        self.assertIs(report["gpsPersistenceEnabled"], True)
+        self.assertIsNone(report["setupPresenceEnabled"])
+        self.assertIn("Windows START LOCAL", report["message"])
+        self.assertIn("setupPresenceEnabled=true", report["message"])
+        for change in ({"gpsPersistenceEnabled": False}, {"scope": None}, {"mode": "unknown"}):
+            self.assertEqual(self.probe(json.dumps({**flags, **change}).encode())["state"], "unverified")
+        del flags["scope"]
+        self.assertEqual(self.probe(json.dumps(flags).encode())["state"], "unverified")
+
+    def test_timeout_and_http_errors_are_sanitized_no_server_body_or_redirect(self):
+        for problem in (TimeoutError(SECRET), backend.URLError(SECRET), backend.HTTPError("https://fixture.invalid", 302, SECRET, {}, None)):
+            opener = Mock(); opener.open.side_effect = problem
+            with patch.object(backend, "build_opener", return_value=opener):
+                report = backend.check_backend("https://api.example.test")
+            self.assertNotIn(SECRET, json.dumps(report))
+            self.assertNotEqual(report["state"], "ready")
+        self.assertIsNone(backend.NoRedirect().redirect_request(None, None, None, None))
 
 
 if __name__ == "__main__":
