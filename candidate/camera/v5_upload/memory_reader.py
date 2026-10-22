@@ -130,6 +130,21 @@ class MemoryReader:
             # original gates used below, not new detection thresholds.
             diagnostic.update(candidates=len(raw), registration={key: registration.get(key)
                 for key in ('quality', 'inliers', 'inlier_ratio', 'scale')}, reasons=warnings)
+            # Diagnostic-only: native review can withhold a number even when the
+            # publication warning list is empty. Preserve its original reason
+            # and measured geometry without changing any acceptance decision.
+            diagnostic['gauge_checks'] = {}
+            for key, gauge in gauges.items():
+                reasons = [reason for reason in warnings
+                           if reason.startswith(key + ':') or reason.split(':', 1)[0] not in baseline.GAUGES]
+                if gauge.get('quality_status') == 'review' or gauge.get('detection_quality') == 'review':
+                    reasons.append('native_review:' + str(gauge.get('mask_mode', 'unknown')))
+                diagnostic['gauge_checks'][key] = dict(
+                    mode=gauge.get('mask_mode'), native_quality=gauge.get('quality_status'),
+                    native_detection_quality=gauge.get('detection_quality'),
+                    span_px=gauge.get('line_span'), hub_error_px=gauge.get('hub_error'),
+                    fit_p90_px=gauge.get('fit_p90'), near_hub_px=gauge.get('endpoint_hub_near'),
+                    radial_continuity=gauge.get('radial_continuity'), reasons=reasons)
             record = dict(attempt=self.attempt, gauges=gauges, sample=sample)
             if self.partial_quality:
                 # Keep every original quality/geometry threshold. Unlike the

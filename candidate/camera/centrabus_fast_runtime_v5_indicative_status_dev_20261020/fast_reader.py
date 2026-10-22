@@ -298,7 +298,7 @@ def diagnostic_lines(cycle, timestamp, frame, detection, metadata, *, calibratio
 
 def monitor(camera, folder, *, detector=read_frame, max_cycles=None, interval=1.0,
             output=None, errors=None, observer=None, sleep=time.sleep, diagnostics=False,
-            calibration=None):
+            calibration=None, publisher=None):
     """Infinite live loop. max_cycles/observer exist for camera-free tests only.
 
     No frame/result history is retained. A capture failure consumes its cycle,
@@ -307,6 +307,7 @@ def monitor(camera, folder, *, detector=read_frame, max_cycles=None, interval=1.
     output = output if output is not None else sys.stdout
     errors = errors if errors is not None else sys.stderr
     cycle = 0
+    publish_state = None
     try:
         while max_cycles is None or cycle < max_cycles:
             cycle += 1
@@ -337,6 +338,17 @@ def monitor(camera, folder, *, detector=read_frame, max_cycles=None, interval=1.
                     if diagnostics:
                         brief_error(cycle, f"detection failed: {type(exc).__name__}: {exc}", errors)
             readings = readings_for(detection, calibration=calibration)
+            if publisher is not None and frame is not None:
+                try:
+                    publisher.offer(frame, timestamp, readings,
+                                    getattr(camera, 'last_metadata', {}).get('timestamp_source'))
+                except Exception:
+                    # Optional delivery cannot stop capture or touch GPS services.
+                    brief_error(cycle, 'Camera dashboard publish unavailable; no credentials logged.', errors)
+                current_publish_state = getattr(publisher, 'last_result', None)
+                if current_publish_state in ('waiting', 'acknowledged', 'unavailable', 'dropped_stale') and current_publish_state != publish_state:
+                    brief_error(cycle, 'Camera dashboard delivery: '+current_publish_state, errors)
+                    publish_state = current_publish_state
             print(terminal_line(cycle, timestamp, readings, capture_available=not capture_failed),
                   file=output, flush=True)
             gauge_errors = detection.get("errors", {})
@@ -408,7 +420,11 @@ def main(argv=None):
     parser.add_argument("--replay-image", type=Path, help="Prerecorded input; never opens the camera")
     parser.add_argument("--replay-cycles", type=int,
                         help="Finite camera-free verification only; live monitoring is always indefinite")
+    parser.add_argument('--publish-config', type=Path, help='Private camera-only credential config; never a GPS config')
+    parser.add_argument('--approve-publish', action='store_true', help='Explicitly authorize numerical camera storage and ephemeral previews')
     args = parser.parse_args(argv)
+    if bool(args.publish_config) != args.approve_publish or args.publish_config and args.replay_image:
+        parser.error('Publishing requires BOTH --publish-config and --approve-publish; replay publishing is forbidden')
     if any(not math.isfinite(v) or v < 0 for v in (args.interval, args.settle_seconds)):
         parser.error("interval and settle time must be finite and nonnegative")
     if args.replay_cycles is not None and (args.replay_image is None or args.replay_cycles < 1):
@@ -420,22 +436,29 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _stop)
     cv2.setNumThreads(2)
     camera = None
+    publisher = None
     try:
         # Fail missing reference dependencies before opening the physical camera.
         from centrabus_dashboard_reader import reference_features
         reference_features()
         calibration = load_calibration(args.condition_config)
+        if args.publish_config:
+            from dashboard_publish import Publisher, load_config
+            private_config = load_config(args.publish_config)
+            if private_config['device_id'] != 'GPS-002':
+                raise ValueError('STOP: this Pi2 candidate requires its own GPS-002 camera credential')
+            publisher = Publisher(private_config)
         folder = session_folder(args.output_root)
         mode = "prerecorded input" if args.replay_image else "Picamera2 initialization OK"
         camera = ReplayCamera(args.replay_image) if args.replay_image else PersistentCamera(
-            args.settle_seconds, collect_metadata=args.diagnostics)
+            args.settle_seconds, collect_metadata=args.diagnostics or publisher is not None)
         if args.diagnostics:
             print(f"{mode} | {CAMERA_SIZE[0]}x{CAMERA_SIZE[1]} | continuous, one capture/cycle | "
                   "numerical calibration UNVERIFIED", flush=True)
             print(f"Cycles 1-10 annotated JPGs: {folder}", flush=True)
         print(f"Annotated JPGs: {folder}", flush=True)
         monitor(camera, folder, max_cycles=args.replay_cycles, interval=args.interval,
-                diagnostics=args.diagnostics, calibration=calibration)
+                diagnostics=args.diagnostics, calibration=calibration, publisher=publisher)
         camera = None  # monitor owns cleanup, including exceptions
         return 0
     except KeyboardInterrupt:
@@ -445,6 +468,8 @@ def main(argv=None):
         print(f"Runtime/initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 1
     finally:
+        if publisher is not None:
+            publisher.close()
         if camera is not None:
             camera.close()
 

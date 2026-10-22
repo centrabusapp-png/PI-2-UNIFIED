@@ -2,6 +2,52 @@
 
 ## New RAM-only live pipeline (supersedes the file-writing preview trial)
 
+### One-window GPS and camera startup
+
+The Windows `Start Pi2 System.cmd` launcher discovers the laptop/Pi's current
+LAN and stages a public foreground supervisor. It passes `--backend-url` through
+the existing camera guard and live process. This validates a trusted private
+IPv4 HTTP origin on port 5000 and overrides the endpoint in memory for the
+session. The camera-private JSON, secret, original detector and calibration are
+unchanged. The previous saved Wi-Fi IP is not used by a new combined session.
+See the laptop's `local-testing/PI2_SYSTEM.md` for startup/reconnect behavior and
+the existing GPS monitor/dependency requirements.
+
+### Startup lifecycle correction (October 22)
+
+The camera guard now snapshots the five desktop-media units' actual stable
+states on EACH invocation. Loaded inactive (headless) units are valid; only
+originally active units are temporarily stopped and then restored. Missing
+inactive units are never enabled or started. Failed, masked, transitional or
+unreadable states, another camera owner and incomplete restoration still block
+camera startup. A second state check follows any sudo prompt. Original GPS
+service identity/state/restart checks, exclusive locks and detector pins remain.
+
+Readiness reports distinguish a wrong backend mode/invalid report (no retry)
+from bounded transient network/503 failures (retry with the current session
+origin). They no longer hide every cause behind a generic backend-restart
+message. Combined startup keeps its one working GPS sender running if only
+the camera is blocked; it retries only explicit transient camera failures.
+Unverified ownership/restoration is never automatically accepted. The laptop
+network supervisor still rediscovers BOTH endpoints after a LAN change.
+These are offline-tested changes, not proof of a physical Wi-Fi handover.
+
+### Diagnostic-only update (October 21)
+
+The processor remains routing-v3. The original detector, calibration and every
+numerical acceptance threshold are unchanged. RAM_CAMERA_PROGRESS now includes
+per-gauge native mode/quality and measured shaft/hub/fit/continuity checks. A
+separate RAM_PRESSURE_CHECK line summarizes Front/Rear rejection reasons. Native
+review is reported explicitly even when the publication warning list is empty.
+These are stdout diagnostics only; no Pi image, state or log file is created.
+
+The companion Windows `Open Pi2 Camera.cmd` starts the guarded continuous session
+without pasted commands, using the existing trusted SSH account and interactive
+password prompts. It is not a boot service, installer, automatic git updater or
+browser-to-Pi control API. It can keep a small allowlisted numeric status report
+on Windows; it never saves image bytes or passwords. The dashboard Preview
+switch remains a display switch. Explicit Capture is still the only image save.
+
 ### Current V3: original full-shaft pressure routing correction
 
 Processor is now `centrabus-fast-v5-3754055-routing-v3`. In a private AST copy
@@ -26,8 +72,11 @@ when Preview is off. Turning it on starts new reads; stale values are withheld.
 This display switch does not remotely shut down the physical Pi camera/process.
 Fresh/Stale source timestamps identify the analysis age. Capture freezes the
 same fresh analysis image/readings, or live pixels with no old numeric values.
-Status captions reuse original 25/75 dial bands (Empty/Half/Full, Cold/Hot and
-Low/High). They remain dial estimates, not new physical/safety classifications.
+Fuel captions now describe below/at/above the actual E-F midpoint; the old
+25-75 percent "Half" bucket was a display-label bug. Other status captions
+retain their original dial bands. These are dial estimates, not new physical
+or safety classifications. Existing alignment calibration is distinct from
+independently validated fuel volume, temperature, voltage or pressure accuracy.
 
 ### Current: user-approved per-gauge quality publication
 
@@ -197,8 +246,8 @@ bash ./run_memory_trial.sh --approve-memory-preview --approve-gps-camera-mode
 ```
 
 The guard verifies files/config/baseline, NTP, memory, updated backend readiness
-and exclusive camera ownership before opening hardware. It restores the same
-five originally active desktop media units and compares GPSD/monitor/sender
+and exclusive camera ownership before opening hardware. It restores exactly
+the originally active desktop media subset and compares GPSD/monitor/sender
 state/PIDs/restarts after all exit paths. Audio/microphone apps can pause. It
 does not start the inactive GPS monitor or its failed GNSS-tuner dependency.
 Do not restart that dependency as a side effect of camera testing.

@@ -122,6 +122,22 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(all(r['quality']=='uncertain' and r['value'] is None for r in frame['readings']
                             if r['gauge_key'] in ('fuel','oilPressure')))
 
+    def test_pressure_diagnostic_explains_native_review_without_weakening_publication(self):
+        def mutate(raw):
+            raw['front'].update(mask_mode='live_component',quality_status='review',detection_quality='review')
+            raw['rear'].update(line_span=12)
+        engine,frame=self.partial_case(mutate)
+        report=live.pressure_report(engine.last_diagnostic)
+        self.assertEqual(report['front']['quality'],'uncertain')
+        self.assertIn('native_review:live_component',report['front']['reasons'])
+        self.assertEqual(report['rear']['span_px'],12)
+        self.assertIn('rear:geometry_short_shaft:12.0',report['rear']['reasons'])
+        self.assertNotIn('value',report['front'])
+        self.assertTrue(all(r['value'] is None for r in frame['readings'] if r['gauge_key'] in ('frontAir','rearAir')))
+        self.assertEqual(engine.last_diagnostic['detected'],4)
+        self.assertIsNone(live.pressure_report(None))
+        self.assertIsNone(live.pressure_report({'reasons':['orb_registration']}))
+
     def test_partial_actual_calibration_reference_keeps_pressure_rejection_without_hiding_valid_gauges(self):
         import cv2
         import builtins

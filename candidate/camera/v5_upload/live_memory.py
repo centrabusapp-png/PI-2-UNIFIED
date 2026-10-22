@@ -9,6 +9,7 @@ import argparse
 import hmac
 import http.client
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -19,10 +20,80 @@ import threading
 import time
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
+import urllib.request
 from uuid import uuid4
 
 sys.dont_write_bytecode = True
 PROCESSOR = 'centrabus-fast-v5-3754055-routing-v3'
+
+
+def session_config(config, backend_url=None):
+    """A public LAN origin override for this process; never rewrite secrets."""
+    result = dict(config)
+    if backend_url is None:
+        return result
+    url = urlsplit(backend_url)
+    address = ipaddress.IPv4Address(url.hostname or '')
+    trusted = any(address in ipaddress.IPv4Network(cidr) for cidr in
+                  ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+    if (not trusted or url.scheme != 'http' or url.port != 5000
+            or url.username is not None or url.password is not None
+            or url.path not in ('', '/') or url.query or url.fragment
+            or config.get('allow_trusted_lan_http') is not True):
+        raise ValueError('Reviewed trusted LAN origin required')
+    result['backend_url'] = f'http://{address}:5000'
+    return result
+
+
+class BackendReadinessError(Exception):
+    """Public reason only; never include a response/config/credential in logs."""
+    def __init__(self, reason, retryable=False):
+        super().__init__(reason)
+        self.retryable = retryable
+
+
+def camera_backend_ready(config, full_system, opener=None):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_args, **_kwargs):
+            raise BackendReadinessError('REDIRECT_REJECTED')
+
+    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(config['backend_url'] + '/readyz', timeout=3) as response:
+            body = response.read(8193)
+            if response.status != 200:
+                raise BackendReadinessError('HTTP_' + str(response.status), response.status in (408, 429, 500, 502, 503, 504))
+            if len(body) > 8192:
+                raise BackendReadinessError('REPORT_TOO_LARGE')
+    except HTTPError as error:
+        code = error.code
+        error.close()
+        raise BackendReadinessError('HTTP_' + str(code), code in (408, 429, 500, 502, 503, 504)) from None
+    except (URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
+        raise BackendReadinessError('NETWORK_UNREACHABLE', True) from None
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise BackendReadinessError('INVALID_REPORT') from None
+    expected = dict(ready=True, cameraLiveMemoryEnabled=True, cameraFramesEnabled=True,
+                    gpsPersistenceEnabled=full_system, simulation=False)
+    if full_system:
+        expected['localFullSystem'] = True
+    if not isinstance(data, dict) or any(data.get(key) is not value for key, value in expected.items()):
+        raise BackendReadinessError('BACKEND_MODE_REJECTED')
+
+
+def wait_camera_backend(config, full_system, *, opener=None, attempts=4, sleep=time.sleep, emit=print):
+    for attempt in range(attempts):
+        try:
+            camera_backend_ready(config, full_system, opener)
+            emit('RAM_CAMERA_BACKEND_READY=PASS; IMAGE_FILES_WRITTEN=false')
+            return
+        except BackendReadinessError as error:
+            if not error.retryable or attempt + 1 == attempts:
+                raise
+            emit(f'RAM_CAMERA_BACKEND=RETRY; REASON={error}; ATTEMPT={attempt + 1}')
+            sleep(min(attempt + 1, 3))
 
 
 class PreviewUnavailable(Exception):
@@ -175,6 +246,15 @@ class MemoryCamera:
             self.camera.close()
 
 
+def pressure_report(diagnostic):
+    if not isinstance(diagnostic, dict) or not diagnostic.get('gauge_checks'):
+        return None
+    fields = ('mode', 'span_px', 'hub_error_px', 'fit_p90_px', 'near_hub_px', 'radial_continuity', 'reasons')
+    return {key: dict(quality=diagnostic.get('qualities', {}).get(key, 'unknown'),
+                     **{field: diagnostic['gauge_checks'].get(key, {}).get(field) for field in fields})
+            for key in ('front', 'rear')}
+
+
 def run_session(camera, analyzer, publisher, transport, wrapper, config, *, seconds=60, fps=8,
                 clock=time.monotonic, wall=time.time, emit=print, stop_event=None):
     previews, analyses = LatestSlot(), LatestSlot()
@@ -304,6 +384,9 @@ def run_session(camera, analyzer, publisher, transport, wrapper, config, *, seco
                     analysis_error_phase=stats['analysis_error_phase'],
                     analysis_inflight_ms=0 if analysis_started_at[0] is None else max(0, round((clock()-analysis_started_at[0])*1000)),
                     analysis_last=stats['analysis_last']), separators=(',', ':')))
+                pressure = pressure_report(stats['analysis_last'])
+                if pressure:
+                    emit('RAM_PRESSURE_CHECK=' + json.dumps(pressure, separators=(',', ':')))
                 next_report = clock() + 5
             stop.wait(max(0, 1 / fps - (clock() - tick)))
     finally:
@@ -338,6 +421,7 @@ def main(args=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime-dir', type=Path, required=True)
     parser.add_argument('--private-config', type=Path, required=True)
+    parser.add_argument('--backend-url', help='Trusted LAN origin for this session only')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--approve-camera-upload', action='store_true')
     parser.add_argument('--seconds', type=int, default=60)
@@ -353,7 +437,7 @@ def main(args=None):
         transport = wrapper.load_transport(Path(__file__).with_name('dashboard_publish.py'))
         if os.name != 'posix' or parsed.private_config.stat().st_uid != os.getuid():
             raise ValueError('Use reviewed Pi2 account')
-        config = transport.load_config(parsed.private_config)
+        config = session_config(transport.load_config(parsed.private_config), parsed.backend_url)
         if config['device_id'] != 'GPS-002' or config['camera_id'] != 'CAM-002':
             raise ValueError('Reviewed Pi2 identity required')
         wrapper.verify_dependencies()
