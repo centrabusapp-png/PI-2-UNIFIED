@@ -32,3 +32,5 @@ venv/
 
 # New camera runtime output stays local; committed evidence is offline only.
 /candidate/camera/centrabus_fast_runtime_v5_indicative_status_dev_20261020/annotations/
+/candidate/camera/centrabus_live_runtime_v6_dev_20261023/annotations/
+/candidate/camera/centrabus_live_runtime_v6_dev_20261023/validation/

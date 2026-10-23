@@ -4,6 +4,23 @@ Prepared locally on October 18, 2026 for GPS-002. The same supplied source proje
 
 Read `DEVICE.md`, `AI_SETUP_INSTRUCTIONS.md`, and `GPS_STUCK_MARKER.md` first. This is a source/reference package with separately identified local candidates, not an installed or physically validated unified system.
 
+## Current camera-calibration candidate: V6
+
+The reviewed October 23 V6 runtime and its exact calibration reference are now
+packaged separately in
+[`candidate/camera/centrabus_live_runtime_v6_dev_20261023/`](candidate/camera/centrabus_live_runtime_v6_dev_20261023/README.md).
+It uses one processing pipeline for all six gauges and preserves the V5
+calibration constants, REVIEW warnings, and unsupported-value abstention.
+See [CAMERA_UPDATE_2026-10-23.md](CAMERA_UPDATE_2026-10-23.md) for the 130-image
+regression and 60-cycle camera-run results, remaining REAR limitations, and
+camera-free verification. The saved live frames show a display/video test
+scene; this does not establish physical-dashboard measurement accuracy.
+
+V6 is the current standalone camera development candidate. Existing V5 upload,
+preview and system launchers remain on their original processors; this source
+publication does not switch them to V6, enroll a new processor, start hardware,
+or connect V6 estimates to Express/Supabase.
+
 ## Local browser setup GUI candidate
 
 See `GUI_SETUP.md`. The new `setup-pi.py` opens a local browser setup page on

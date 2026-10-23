@@ -41,6 +41,14 @@ Only after this passes, separately authorize the sender test against the reviewe
 
 ## 5. Camera-only test
 
+October 23 V6 update: start with [CAMERA_UPDATE_2026-10-23.md](CAMERA_UPDATE_2026-10-23.md)
+and the separate V6 folder's README. Its explicit entry point is `live_reader.py`;
+the older `fast_reader.py --state-path/--log-dir` example below applies only to
+the historical file-based V5 candidate. V6 uses a bundled exact reference image,
+one six-gauge pipeline and separate REVIEW estimates/publication values. Its
+JSON-safe data boundary has no uploader. Existing V5 upload/system launchers must
+not be relabeled as V6 or silently enrolled under a new processor identity.
+
 Confirm the team's canonical runtime. `candidate/camera` uses the uploaded V5 implementation as a bounded test candidate; do not assume the highest version number is the deployed best version. Verify camera model/modes and existing OS-managed Picamera2/libcamera dependencies; do not blindly pip/apt-upgrade the GPS environment. The copied calibration0 assets must match the camera mounting and reference images.
 
 Do not run the copied unauthenticated Flask stages or their installer as an admin/cloud API. They include capture/delete/download operations and retain local images. Use one camera owner and a bounded single-cycle test first. In the approved camera environment, from the staged candidate directory, the example test is `python3 fast_reader.py --cycles 1 --state-path <new-test-directory>/latest_gauges.json --log-dir <new-test-directory>/logs`. Substitute an approved writable absolute directory, never an existing production state file. This opens a real camera and requires physical authorization.
